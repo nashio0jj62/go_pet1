@@ -1,0 +1,43 @@
+@baseUrl = http://localhost:8080
+
+### Liveness
+GET {{baseUrl}}/healthz
+
+### Create a payment. Repeat this request to reuse the same payment ID.
+# @name createPayment
+POST {{baseUrl}}/payments
+Content-Type: application/json
+Idempotency-Key: demo-order-001
+
+{
+  "merchant_id": "demo-shop",
+  "amount": 12500,
+  "currency": "KZT"
+}
+
+### Wait for the projection, then request the returned payment ID.
+# VS Code REST Client can resolve the response reference below.
+GET {{baseUrl}}/payments/{{createPayment.response.body.$.payment_id}}
+
+### Same merchant and key, different amount: expect 409 Conflict.
+POST {{baseUrl}}/payments
+Content-Type: application/json
+Idempotency-Key: demo-order-001
+
+{
+  "merchant_id": "demo-shop",
+  "amount": 99900,
+  "currency": "KZT"
+}
+
+### Invalid amount: expect 400 Bad Request.
+POST {{baseUrl}}/payments
+Content-Type: application/json
+Idempotency-Key: demo-order-002
+
+{
+  "merchant_id": "demo-shop",
+  "amount": -100,
+  "currency": "KZT"
+}
+
