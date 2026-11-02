@@ -16,6 +16,7 @@ import (
 	"payway/internal/config"
 	"payway/internal/httpapi"
 	"payway/internal/storage"
+	"payway/internal/telemetry"
 )
 
 func main() {
@@ -33,6 +34,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	shutdownTelemetry, err := telemetry.Setup(ctx, "payway-api")
+	if err != nil {
+		return err
+	}
+	defer shutdownTelemetry()
 	db, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return errors.New("cannot initialize PostgreSQL pool; check DATABASE_URL")

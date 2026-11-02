@@ -13,6 +13,7 @@ import (
 	"payway/internal/payment"
 	"payway/internal/provider"
 	"payway/internal/storage"
+	"payway/internal/telemetry"
 )
 
 type Worker struct {
@@ -159,7 +160,7 @@ func (w *Worker) publish(ctx context.Context, event payment.Event) (payment.Paym
 	if err := broker.Publish(ctx, w.Events, event.Payment.ID, event); err != nil {
 		return payment.Payment{}, err
 	}
-	slog.Info("payment event published", "payment_id", event.Payment.ID, "event_id", event.ID)
+	slog.Info("payment event published", "payment_id", event.Payment.ID, "event_id", event.ID, "trace_id", telemetry.TraceID(ctx))
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -189,6 +190,6 @@ func (w *Worker) HandleEvent(ctx context.Context, message kafka.Message) error {
 	if err := w.Store.Apply(ctx, event); err != nil {
 		return err
 	}
-	slog.Info("payment event stored", "payment_id", event.Payment.ID, "event_id", event.ID)
+	slog.Info("payment event stored", "payment_id", event.Payment.ID, "event_id", event.ID, "trace_id", telemetry.TraceID(ctx))
 	return nil
 }

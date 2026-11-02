@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS traceparent TEXT NOT NULL DEFAULT '';
+ALTER TABLE mock_provider_payments ADD COLUMN IF NOT EXISTS traceparent TEXT NOT NULL DEFAULT '';
+
+COMMIT;

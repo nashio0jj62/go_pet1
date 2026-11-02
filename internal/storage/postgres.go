@@ -8,8 +8,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"payway/internal/payment"
+	"payway/internal/telemetry"
 )
 
 var (
@@ -81,7 +84,15 @@ func (s *Store) History(ctx context.Context, id string, after, limit int) ([]pay
 	return events, rows.Err()
 }
 
-func (s *Store) Apply(ctx context.Context, event payment.Event) error {
+func (s *Store) Apply(ctx context.Context, event payment.Event) (retErr error) {
+	ctx, span := telemetry.Tracer.Start(ctx, "payment.project", trace.WithAttributes(
+		attribute.String("payment.id", event.Payment.ID), attribute.Int("payment.version", event.Payment.Version)))
+	defer func() {
+		if retErr != nil {
+			telemetry.Error(ctx, "projection", "apply", retErr)
+		}
+		span.End()
+	}()
 	if err := event.Validate(); err != nil {
 		return err
 	}
@@ -122,6 +133,7 @@ func (s *Store) Apply(ctx context.Context, event payment.Event) error {
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
+	var applied []payment.Payment
 	for {
 		var data []byte
 		err := tx.QueryRow(ctx, `SELECT payload FROM payment_events WHERE payment_id = $1 AND version = $2`,
@@ -161,6 +173,33 @@ func (s *Store) Apply(ctx context.Context, event payment.Event) error {
 			return err
 		}
 		current = p
+		applied = append(applied, p)
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	for _, p := range applied {
+		telemetry.PaymentApplied(ctx, p)
+	}
+	return nil
+}
+
+func (s *Store) TraceParent(ctx context.Context, id string) (string, error) {
+	var parent string
+	err := s.DB.QueryRow(ctx, `SELECT traceparent FROM payment_requests WHERE payment_id = $1`, id).Scan(&parent)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return parent, err
+}
+
+func (s *Store) RememberTrace(ctx context.Context, id, parent string) (string, error) {
+	var stored string
+	err := s.DB.QueryRow(ctx, `UPDATE payment_requests
+		SET traceparent = CASE WHEN traceparent = '' THEN $2 ELSE traceparent END
+		WHERE payment_id = $1 RETURNING traceparent`, id, parent).Scan(&stored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return parent, nil
+	}
+	return stored, err
 }

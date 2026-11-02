@@ -11,7 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"payway/internal/payment"
+	"payway/internal/telemetry"
 )
 
 type Request struct {
@@ -27,6 +33,7 @@ type Result struct {
 	Status        payment.Status `json:"status"`
 	FailureReason string         `json:"failure_reason,omitempty"`
 	UpdatedAt     time.Time      `json:"updated_at"`
+	TraceParent   string         `json:"-"`
 }
 
 type Callback struct {
@@ -71,7 +78,21 @@ func (c *Client) Cancel(ctx context.Context, id string) (Result, error) {
 	return c.call(ctx, "/payments/"+id+"/cancel", id, nil)
 }
 
-func (c *Client) call(ctx context.Context, path, id string, value any) (Result, error) {
+func (c *Client) call(ctx context.Context, path, id string, value any) (result Result, retErr error) {
+	operation := "create"
+	if value == nil {
+		operation = "cancel"
+	}
+	ctx, span := telemetry.Tracer.Start(ctx, "provider."+operation, trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("payment.id", id)))
+	started := time.Now()
+	defer func() {
+		telemetry.ProviderRequest(ctx, operation, started)
+		if retErr != nil {
+			telemetry.Error(ctx, "provider", operation, retErr)
+		}
+		span.End()
+	}()
 	data, err := json.Marshal(value)
 	if err != nil {
 		return Result{}, err
@@ -83,15 +104,16 @@ func (c *Client) call(ctx context.Context, path, id string, value any) (Result, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Idempotency-Key", id)
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	response, err := c.HTTP.Do(req)
 	if err != nil {
 		return Result{}, err
 	}
 	defer response.Body.Close()
+	span.SetAttributes(attribute.Int("http.response.status_code", response.StatusCode))
 	if response.StatusCode != http.StatusOK {
 		return Result{}, fmt.Errorf("provider returned HTTP %d", response.StatusCode)
 	}
-	var result Result
 	if err := json.NewDecoder(io.LimitReader(response.Body, 8192)).Decode(&result); err != nil {
 		return Result{}, err
 	}

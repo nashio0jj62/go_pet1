@@ -14,8 +14,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"payway/internal/payment"
+	"payway/internal/telemetry"
 )
 
 type Mock struct {
@@ -29,14 +34,14 @@ func (m *Mock) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /payments", m.start)
 	mux.HandleFunc("POST /payments/{id}/cancel", m.cancel)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return telemetry.HTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if m.Secret == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")),
 			[]byte("Bearer "+m.Secret)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		mux.ServeHTTP(w, r)
-	})
+	}))
 }
 
 func (m *Mock) start(w http.ResponseWriter, r *http.Request) {
@@ -61,9 +66,13 @@ func (m *Mock) start(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	ctx, finish := telemetry.StartHTTP(ctx, w, "mock.create", input.PaymentID)
+	defer finish()
 	_, err := m.DB.Exec(ctx, `INSERT INTO mock_provider_payments
-		(payment_id, merchant_id, amount, currency, status) VALUES ($1, $2, $3, $4, 'PROCESSING')
-		ON CONFLICT (payment_id) DO NOTHING`, input.PaymentID, input.MerchantID, input.Amount, input.Currency)
+		(payment_id, merchant_id, amount, currency, status, traceparent) VALUES ($1, $2, $3, $4, 'PROCESSING', $5)
+		ON CONFLICT (payment_id) DO UPDATE SET traceparent =
+		CASE WHEN mock_provider_payments.traceparent = '' THEN EXCLUDED.traceparent ELSE mock_provider_payments.traceparent END`,
+		input.PaymentID, input.MerchantID, input.Amount, input.Currency, telemetry.TraceParent(ctx))
 	if m.databaseError(w, err) {
 		return
 	}
@@ -91,6 +100,8 @@ func (m *Mock) cancel(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	ctx, finish := telemetry.StartHTTP(ctx, w, "mock.cancel", id)
+	defer finish()
 	_, err := m.DB.Exec(ctx, `UPDATE mock_provider_payments SET status = 'CANCELED', updated_at = now(),
 		next_attempt_at = now() WHERE payment_id = $1 AND status = 'PROCESSING'`, id)
 	if m.databaseError(w, err) {
@@ -108,9 +119,9 @@ func (m *Mock) cancel(w http.ResponseWriter, r *http.Request) {
 
 func (m *Mock) result(ctx context.Context, id string) (Result, error) {
 	var result Result
-	err := m.DB.QueryRow(ctx, `SELECT payment_id, status, failure_reason, updated_at
+	err := m.DB.QueryRow(ctx, `SELECT payment_id, status, failure_reason, updated_at, traceparent
 		FROM mock_provider_payments WHERE payment_id = $1`, id).Scan(
-		&result.PaymentID, &result.Status, &result.FailureReason, &result.UpdatedAt)
+		&result.PaymentID, &result.Status, &result.FailureReason, &result.UpdatedAt, &result.TraceParent)
 	result.ProviderID = "mock_" + id
 	result.UpdatedAt = result.UpdatedAt.UTC()
 	return result, err
@@ -190,29 +201,44 @@ func (m *Mock) deliver(ctx context.Context) error {
 	return nil
 }
 
-func (m *Mock) send(ctx context.Context, callback Callback) bool {
+func (m *Mock) send(ctx context.Context, callback Callback) (sent bool) {
+	ctx = telemetry.Parent(ctx, callback.TraceParent)
+	ctx, span := telemetry.Tracer.Start(ctx, "callback.send", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("payment.id", callback.PaymentID)))
+	defer func() {
+		if !sent && ctx.Err() == nil {
+			telemetry.CallbackRetry(ctx)
+		}
+		span.End()
+	}()
 	body, err := json.Marshal(callback)
 	if err != nil {
+		telemetry.Error(ctx, "callback", "encode", err)
 		return false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.CallbackURL, bytes.NewReader(body))
 	if err != nil {
 		slog.Error("create callback request", "error", err)
+		telemetry.Error(ctx, "callback", "request", err)
 		return false
 	}
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Callback-Timestamp", timestamp)
 	req.Header.Set("X-Callback-Signature", Signature(m.Secret, timestamp, body))
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	response, err := m.HTTP.Do(req)
 	if err != nil {
 		slog.Warn("callback delivery failed", "payment_id", callback.PaymentID, "error", err)
+		telemetry.Error(ctx, "callback", "delivery", err)
 		return false
 	}
 	defer response.Body.Close()
+	span.SetAttributes(attribute.Int("http.response.status_code", response.StatusCode))
 	io.Copy(io.Discard, io.LimitReader(response.Body, 8192))
 	if response.StatusCode != http.StatusAccepted {
 		slog.Warn("callback rejected", "payment_id", callback.PaymentID, "status", response.StatusCode)
+		telemetry.Error(ctx, "callback", "rejected", errors.New(http.StatusText(response.StatusCode)))
 		return false
 	}
 	return true

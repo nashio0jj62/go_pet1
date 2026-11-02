@@ -10,6 +10,7 @@ x-app: &app
     PROVIDER_URL: http://mock-psp:8081
     CALLBACK_URL: http://api:8080/callbacks/mock
     CALLBACK_SECRET: "${CALLBACK_SECRET:?Set CALLBACK_SECRET in .env}"
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
   depends_on:
     postgres:
       condition: service_healthy
@@ -17,6 +18,8 @@ x-app: &app
       condition: service_completed_successfully
     migrate:
       condition: service_completed_successfully
+    otel-collector:
+      condition: service_started
   restart: on-failure
   stop_grace_period: 30s
 
@@ -39,6 +42,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
     restart: on-failure
     stop_grace_period: 30s
 
@@ -51,9 +56,58 @@ services:
         condition: service_healthy
     volumes:
       - ./migrations/002_processing.sql:/migrations/002_processing.sql:ro
+      - ./migrations/003_tracing.sql:/migrations/003_tracing.sql:ro
     entrypoint: ["psql"]
-    command: ["-h", "postgres", "-U", "payway", "-d", "payway", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_processing.sql"]
+    command: ["-h", "postgres", "-U", "payway", "-d", "payway", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_processing.sql", "-f", "/migrations/003_tracing.sql"]
     restart: on-failure
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./monitoring/collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      jaeger:
+        condition: service_started
+    restart: on-failure
+
+  jaeger:
+    image: jaegertracing/jaeger:2.4.0
+    ports:
+      - "127.0.0.1:16686:16686"
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/payway.json
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
 
   postgres:
     image: postgres:16-alpine
@@ -112,4 +166,6 @@ services:
 volumes:
   postgres-data:
   kafka-data:
+  prometheus-data:
+  grafana-data:
 

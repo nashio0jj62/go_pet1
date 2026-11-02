@@ -15,6 +15,7 @@ import (
 	"payway/internal/broker"
 	"payway/internal/payment"
 	"payway/internal/storage"
+	"payway/internal/telemetry"
 )
 
 type API struct {
@@ -33,7 +34,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	return mux
+	return telemetry.HTTP(mux)
 }
 
 func (a *API) createPayment(w http.ResponseWriter, r *http.Request) {
@@ -79,13 +80,15 @@ func (a *API) createPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "request storage unavailable; retry with the same Idempotency-Key")
 		return
 	}
+	ctx, finish := a.tracePayment(ctx, w, id, "POST /payments")
+	defer finish()
 	command := payment.NewCommand(id, request, createdAt)
 	if err := broker.Publish(ctx, a.Commands, id, command); err != nil {
 		slog.Error("publish payment command", "payment_id", id, "error", err)
 		writeError(w, http.StatusServiceUnavailable, "publication not confirmed; retry with the same Idempotency-Key")
 		return
 	}
-	slog.Info("payment command accepted", "payment_id", id, "command_id", command.ID)
+	slog.Info("payment command accepted", "payment_id", id, "command_id", command.ID, "trace_id", telemetry.TraceID(ctx))
 	w.Header().Set("Location", "/payments/"+id)
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"payment_id": id, "status_url": "/payments/" + id,
@@ -100,6 +103,8 @@ func (a *API) getPayment(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	ctx, finish := a.tracePayment(ctx, w, id, "GET /payments/{id}")
+	defer finish()
 	p, err := a.Store.Get(ctx, id)
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "payment not found or not yet projected")
