@@ -28,8 +28,6 @@ func Publish(ctx context.Context, writer *kafka.Writer, paymentID string, value 
 	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(paymentID), Value: data})
 }
 
-// Process one message at a time: committing a later offset also commits earlier
-// messages in that partition. Never move on while the current message has failed.
 func Consume(ctx context.Context, brokers []string, topic, group string, handle func(context.Context, kafka.Message) error) error {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers, Topic: topic, GroupID: group,

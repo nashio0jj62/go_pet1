@@ -1,6 +1,4 @@
-.git
-.env
-.env.*
+.*
 *.env
 **/*.pem
 **/*.key
@@ -8,11 +6,6 @@
 **/*.pfx
 **/credentials.json
 secrets
-.aws
-.codex
-.agents
 bin
 tmp
 docs
-.DS_Store
-

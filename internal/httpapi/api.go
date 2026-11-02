@@ -18,15 +18,18 @@ import (
 )
 
 type API struct {
-	Store    *storage.Store
-	Commands *kafka.Writer
+	Store          *storage.Store
+	Commands       *kafka.Writer
+	CallbackSecret string
 }
 
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /payments", a.createPayment)
 	mux.HandleFunc("GET /payments/{id}", a.getPayment)
-	// Liveness only: this does not promise that Kafka or PostgreSQL is available.
+	mux.HandleFunc("POST /payments/{id}/cancel", a.cancelPayment)
+	mux.HandleFunc("GET /payments/{id}/events", a.paymentHistory)
+	mux.HandleFunc("POST /callbacks/mock", a.providerCallback)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -116,7 +119,7 @@ func invalidBody(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 4096 bytes")
 		return
 	}
-	writeError(w, http.StatusBadRequest, "body must contain one valid JSON object with merchant_id, amount and currency")
+	writeError(w, http.StatusBadRequest, "body must contain one valid JSON object with the expected fields")
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

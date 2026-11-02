@@ -68,7 +68,7 @@ func ValidID(id string) bool {
 }
 
 func (r CreateRequest) Fingerprint() string {
-	data, _ := json.Marshal(r) // This struct contains only strings and an integer.
+	data, _ := json.Marshal(r)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -90,13 +90,19 @@ func ValidateTransition(from, to Status) error {
 }
 
 type Payment struct {
-	ID         string    `json:"id"`
-	MerchantID string    `json:"merchant_id"`
-	Amount     int64     `json:"amount"`
-	Currency   string    `json:"currency"`
-	Status     Status    `json:"status"`
-	Version    int       `json:"version"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID            string    `json:"id"`
+	MerchantID    string    `json:"merchant_id"`
+	Amount        int64     `json:"amount"`
+	Currency      string    `json:"currency"`
+	Status        Status    `json:"status"`
+	Version       int       `json:"version"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	ProviderID    string    `json:"provider_id,omitempty"`
+	FailureReason string    `json:"failure_reason,omitempty"`
+}
+
+func (s Status) Terminal() bool {
+	return s == Completed || s == Failed || s == Canceled
 }
 

@@ -1,5 +1,6 @@
-.env
-.env.*
+.*
+!.gitignore
+!.dockerignore
 *.env
 *.pem
 *.key
@@ -7,16 +8,9 @@
 *.pfx
 credentials.json
 secrets/
-.aws/
-.codex/
-.agents/
-.DS_Store
-.idea/
-.vscode/
 /bin/
 /tmp/
 /coverage/
 /docs/
 *.log
 *.test
-

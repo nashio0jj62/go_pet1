@@ -1,6 +1,5 @@
 BEGIN;
 
--- Technical request reservations; these do not represent payment state.
 CREATE TABLE payment_requests (
     payment_id TEXT PRIMARY KEY,
     fingerprint TEXT NOT NULL,

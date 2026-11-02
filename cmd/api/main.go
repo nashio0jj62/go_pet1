@@ -46,7 +46,7 @@ func run(ctx context.Context) error {
 	}
 	commands := broker.NewWriter(cfg.KafkaBrokers, cfg.CommandsTopic)
 	defer commands.Close()
-	api := &httpapi.API{Store: &storage.Store{DB: db}, Commands: commands}
+	api := &httpapi.API{Store: &storage.Store{DB: db}, Commands: commands, CallbackSecret: cfg.CallbackSecret}
 	server := &http.Server{
 		Addr: cfg.HTTPAddr, Handler: api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,

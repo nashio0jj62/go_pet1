@@ -13,6 +13,7 @@ import (
 
 	"payway/internal/broker"
 	"payway/internal/config"
+	"payway/internal/provider"
 	"payway/internal/storage"
 	"payway/internal/worker"
 )
@@ -45,7 +46,10 @@ func run(ctx context.Context) error {
 	}
 	events := broker.NewWriter(cfg.KafkaBrokers, cfg.EventsTopic)
 	defer events.Close()
-	w := &worker.Worker{Events: events, Store: &storage.Store{DB: db}}
+	w := &worker.Worker{
+		Events: events, Store: &storage.Store{DB: db},
+		Provider: provider.NewClient(cfg.ProviderURL, cfg.CallbackSecret),
+	}
 	consumerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results := make(chan error, 2)

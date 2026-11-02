@@ -41,3 +41,35 @@ Idempotency-Key: demo-order-002
   "currency": "KZT"
 }
 
+
+### Payment history
+GET {{baseUrl}}/payments/{{createPayment.response.body.$.payment_id}}/events?after_version=0&limit=50
+
+### Declined by the mock provider
+POST {{baseUrl}}/payments
+Content-Type: application/json
+Idempotency-Key: declined-order-001
+
+{
+  "merchant_id": "demo-shop",
+  "amount": 12513,
+  "currency": "KZT"
+}
+
+### Pending payment for cancellation
+# @name pendingPayment
+POST {{baseUrl}}/payments
+Content-Type: application/json
+Idempotency-Key: pending-order-001
+
+{
+  "merchant_id": "demo-shop",
+  "amount": 12599,
+  "currency": "KZT"
+}
+
+### Cancel after the payment appears in GET
+POST {{baseUrl}}/payments/{{pendingPayment.response.body.$.payment_id}}/cancel
+
+### Cancellation result
+GET {{baseUrl}}/payments/{{pendingPayment.response.body.$.payment_id}}

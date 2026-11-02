@@ -2,15 +2,20 @@ name: payway
 
 x-app: &app
   build: .
-  environment:
+  environment: &app-env
     DATABASE_URL: "postgres://payway:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/payway?sslmode=disable"
     KAFKA_BROKERS: kafka:9092
     KAFKA_COMMANDS_TOPIC: payment.commands
     KAFKA_EVENTS_TOPIC: payment.events
+    PROVIDER_URL: http://mock-psp:8081
+    CALLBACK_URL: http://api:8080/callbacks/mock
+    CALLBACK_SECRET: "${CALLBACK_SECRET:?Set CALLBACK_SECRET in .env}"
   depends_on:
     postgres:
       condition: service_healthy
     kafka-init:
+      condition: service_completed_successfully
+    migrate:
       condition: service_completed_successfully
   restart: on-failure
   stop_grace_period: 30s
@@ -25,6 +30,31 @@ services:
     <<: *app
     entrypoint: ["/app/worker"]
 
+  mock-psp:
+    build: .
+    entrypoint: ["/app/mock-psp"]
+    environment:
+      <<: *app-env
+      HTTP_ADDR: :8081
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+    stop_grace_period: 30s
+
+  migrate:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations/002_processing.sql:/migrations/002_processing.sql:ro
+    entrypoint: ["psql"]
+    command: ["-h", "postgres", "-U", "payway", "-d", "payway", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_processing.sql"]
+    restart: on-failure
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -35,7 +65,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U payway -d payway"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U payway -d payway"]
       interval: 5s
       timeout: 3s
       retries: 20
