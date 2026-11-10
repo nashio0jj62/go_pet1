@@ -1,16 +1,19 @@
 name: payway
 
+x-backend-env: &backend-env
+  DATABASE_URL: "postgres://payway:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/payway?sslmode=disable"
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_EVENTS_TOPIC: payment.events
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+
 x-app: &app
   build: .
   environment: &app-env
-    DATABASE_URL: "postgres://payway:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/payway?sslmode=disable"
-    KAFKA_BROKERS: kafka:9092
+    <<: *backend-env
     KAFKA_COMMANDS_TOPIC: payment.commands
-    KAFKA_EVENTS_TOPIC: payment.events
     PROVIDER_URL: http://mock-psp:8081
     CALLBACK_URL: http://api:8080/callbacks/mock
     CALLBACK_SECRET: "${CALLBACK_SECRET:?Set CALLBACK_SECRET in .env}"
-    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
   depends_on:
     postgres:
       condition: service_healthy
@@ -32,6 +35,11 @@ services:
   worker:
     <<: *app
     entrypoint: ["/app/worker"]
+
+  projection:
+    <<: *app
+    environment: *backend-env
+    entrypoint: ["/app/projection"]
 
   mock-psp:
     build: .
@@ -57,8 +65,23 @@ services:
     volumes:
       - ./migrations/002_processing.sql:/migrations/002_processing.sql:ro
       - ./migrations/003_tracing.sql:/migrations/003_tracing.sql:ro
+      - ./migrations/004_command_idempotency.sql:/migrations/004_command_idempotency.sql:ro
     entrypoint: ["psql"]
-    command: ["-h", "postgres", "-U", "payway", "-d", "payway", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_processing.sql", "-f", "/migrations/003_tracing.sql"]
+    command:
+      - -h
+      - postgres
+      - -U
+      - payway
+      - -d
+      - payway
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /migrations/002_processing.sql
+      - -f
+      - /migrations/003_tracing.sql
+      - -f
+      - /migrations/004_command_idempotency.sql
     restart: on-failure
 
   otel-collector:

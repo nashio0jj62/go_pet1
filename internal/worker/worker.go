@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -31,19 +33,39 @@ func (w *Worker) HandleCommand(ctx context.Context, message kafka.Message) error
 		command.ID == "" || len(command.ID) > 200 || string(message.Key) != command.PaymentID {
 		return errors.New("invalid payment command")
 	}
+	command.CreatedAt = command.CreatedAt.UTC()
+	payload, err := json.Marshal(command)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(payload)
+	fingerprint := hex.EncodeToString(sum[:])
+	completed, err := w.Store.CommandCompleted(ctx, command.ID, fingerprint)
+	if err != nil {
+		return err
+	}
+	if completed {
+		slog.Info("duplicate payment command skipped", "payment_id", command.PaymentID, "command_id", command.ID, "trace_id", telemetry.TraceID(ctx))
+		return nil
+	}
+
 	switch command.Type {
 	case payment.CreatePayment:
-		return w.create(ctx, command)
+		err = w.create(ctx, command)
 	case payment.CancelPayment:
 		if command.ID != "cancel_"+command.PaymentID {
 			return errors.New("invalid cancellation command ID")
 		}
-		return w.cancel(ctx, command)
+		err = w.cancel(ctx, command)
 	case payment.ProviderCallback:
-		return w.callback(ctx, command)
+		err = w.callback(ctx, command)
 	default:
 		return errors.New("unknown payment command")
 	}
+	if err != nil {
+		return err
+	}
+	return w.Store.MarkCommandCompleted(ctx, command.ID, command.PaymentID, fingerprint)
 }
 
 func (w *Worker) create(ctx context.Context, command payment.Command) error {
@@ -177,19 +199,4 @@ func (w *Worker) publish(ctx context.Context, event payment.Event) (payment.Paym
 		case <-ticker.C:
 		}
 	}
-}
-
-func (w *Worker) HandleEvent(ctx context.Context, message kafka.Message) error {
-	var event payment.Event
-	if err := json.Unmarshal(message.Value, &event); err != nil {
-		return err
-	}
-	if string(message.Key) != event.Payment.ID {
-		return errors.New("event key does not match payment ID")
-	}
-	if err := w.Store.Apply(ctx, event); err != nil {
-		return err
-	}
-	slog.Info("payment event stored", "payment_id", event.Payment.ID, "event_id", event.ID, "trace_id", telemetry.TraceID(ctx))
-	return nil
 }

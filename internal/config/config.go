@@ -7,36 +7,51 @@ import (
 	"strings"
 )
 
+type Backend struct {
+	DatabaseURL  string
+	KafkaBrokers []string
+	EventsTopic  string
+}
+
 type Config struct {
+	Backend
 	HTTPAddr       string
-	DatabaseURL    string
-	KafkaBrokers   []string
 	CommandsTopic  string
-	EventsTopic    string
 	ProviderURL    string
 	CallbackURL    string
 	CallbackSecret string
 }
 
-func Load() (Config, error) {
-	c := Config{
-		HTTPAddr:       value("HTTP_ADDR", ":8080"),
-		DatabaseURL:    os.Getenv("DATABASE_URL"),
-		CommandsTopic:  value("KAFKA_COMMANDS_TOPIC", "payment.commands"),
-		EventsTopic:    value("KAFKA_EVENTS_TOPIC", "payment.events"),
-		ProviderURL:    value("PROVIDER_URL", "http://localhost:8081"),
-		CallbackURL:    value("CALLBACK_URL", "http://localhost:8080/callbacks/mock"),
-		CallbackSecret: os.Getenv("CALLBACK_SECRET"),
+func LoadBackend() (Backend, error) {
+	c := Backend{
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		EventsTopic: value("KAFKA_EVENTS_TOPIC", "payment.events"),
 	}
 	for _, broker := range strings.Split(value("KAFKA_BROKERS", "localhost:9092"), ",") {
 		broker = strings.TrimSpace(broker)
 		if broker == "" {
-			return Config{}, errors.New("KAFKA_BROKERS contains an empty broker address")
+			return Backend{}, errors.New("KAFKA_BROKERS contains an empty broker address")
 		}
 		c.KafkaBrokers = append(c.KafkaBrokers, broker)
 	}
 	if c.DatabaseURL == "" {
-		return Config{}, errors.New("DATABASE_URL is required")
+		return Backend{}, errors.New("DATABASE_URL is required")
+	}
+	return c, nil
+}
+
+func Load() (Config, error) {
+	backend, err := LoadBackend()
+	if err != nil {
+		return Config{}, err
+	}
+	c := Config{
+		Backend:        backend,
+		HTTPAddr:       value("HTTP_ADDR", ":8080"),
+		CommandsTopic:  value("KAFKA_COMMANDS_TOPIC", "payment.commands"),
+		ProviderURL:    value("PROVIDER_URL", "http://localhost:8081"),
+		CallbackURL:    value("CALLBACK_URL", "http://localhost:8080/callbacks/mock"),
+		CallbackSecret: os.Getenv("CALLBACK_SECRET"),
 	}
 	if len(c.CallbackSecret) < 32 {
 		return Config{}, errors.New("CALLBACK_SECRET must contain at least 32 characters")

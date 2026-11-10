@@ -56,19 +56,8 @@ func run(ctx context.Context) error {
 		Events: events, Store: &storage.Store{DB: db},
 		Provider: provider.NewClient(cfg.ProviderURL, cfg.CallbackSecret),
 	}
-	consumerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	results := make(chan error, 2)
-	go func() {
-		results <- broker.Consume(consumerCtx, cfg.KafkaBrokers, cfg.CommandsTopic, "payment-workers", w.HandleCommand)
-	}()
-	go func() {
-		results <- broker.Consume(consumerCtx, cfg.KafkaBrokers, cfg.EventsTopic, "projections", w.HandleEvent)
-	}()
-	slog.Info("command consumer and projection started")
-	err = <-results
-	cancel()
-	<-results
+	slog.Info("command consumer started")
+	err = broker.Consume(ctx, cfg.KafkaBrokers, cfg.CommandsTopic, "payment-workers", w.HandleCommand)
 	if ctx.Err() != nil {
 		return nil
 	}

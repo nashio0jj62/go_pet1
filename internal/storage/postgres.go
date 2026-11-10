@@ -167,11 +167,6 @@ func (s *Store) Apply(ctx context.Context, event payment.Event) (retErr error) {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO processed_commands (id, payment_id) VALUES ($1, $2)
-			ON CONFLICT (id) DO NOTHING`, next.CommandID, id)
-		if err != nil {
-			return err
-		}
 		current = p
 		applied = append(applied, p)
 	}
