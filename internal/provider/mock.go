@@ -30,6 +30,8 @@ type Mock struct {
 	HTTP        *http.Client
 }
 
+var errMockPaymentConflict = errors.New("payment ID reused with different data")
+
 func (m *Mock) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /payments", m.start)
@@ -68,25 +70,11 @@ func (m *Mock) start(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ctx, finish := telemetry.StartHTTP(ctx, w, "mock.create", input.PaymentID)
 	defer finish()
-	_, err := m.DB.Exec(ctx, `INSERT INTO mock_provider_payments
-		(payment_id, merchant_id, amount, currency, status, traceparent) VALUES ($1, $2, $3, $4, 'PROCESSING', $5)
-		ON CONFLICT (payment_id) DO UPDATE SET traceparent =
-		CASE WHEN mock_provider_payments.traceparent = '' THEN EXCLUDED.traceparent ELSE mock_provider_payments.traceparent END`,
-		input.PaymentID, input.MerchantID, input.Amount, input.Currency, telemetry.TraceParent(ctx))
-	if m.databaseError(w, err) {
+	result, err := m.createPayment(ctx, input)
+	if errors.Is(err, errMockPaymentConflict) {
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	var stored Request
-	err = m.DB.QueryRow(ctx, `SELECT merchant_id, amount, currency FROM mock_provider_payments WHERE payment_id = $1`,
-		input.PaymentID).Scan(&stored.MerchantID, &stored.Amount, &stored.Currency)
-	if m.databaseError(w, err) {
-		return
-	}
-	if stored.MerchantID != input.MerchantID || stored.Amount != input.Amount || stored.Currency != input.Currency {
-		http.Error(w, "payment ID reused with different data", http.StatusConflict)
-		return
-	}
-	result, err := m.result(ctx, input.PaymentID)
 	if !m.databaseError(w, err) {
 		mockJSON(w, result)
 	}
@@ -102,12 +90,7 @@ func (m *Mock) cancel(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ctx, finish := telemetry.StartHTTP(ctx, w, "mock.cancel", id)
 	defer finish()
-	_, err := m.DB.Exec(ctx, `UPDATE mock_provider_payments SET status = 'CANCELED', updated_at = now(),
-		next_attempt_at = now() WHERE payment_id = $1 AND status = 'PROCESSING'`, id)
-	if m.databaseError(w, err) {
-		return
-	}
-	result, err := m.result(ctx, id)
+	result, err := m.cancelPayment(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		http.Error(w, "payment not found", http.StatusNotFound)
 		return
@@ -115,6 +98,36 @@ func (m *Mock) cancel(w http.ResponseWriter, r *http.Request) {
 	if !m.databaseError(w, err) {
 		mockJSON(w, result)
 	}
+}
+
+func (m *Mock) createPayment(ctx context.Context, input Request) (Result, error) {
+	_, err := m.DB.Exec(ctx, `INSERT INTO mock_provider_payments
+		(payment_id, merchant_id, amount, currency, status, traceparent) VALUES ($1, $2, $3, $4, 'PROCESSING', $5)
+		ON CONFLICT (payment_id) DO UPDATE SET traceparent =
+		CASE WHEN mock_provider_payments.traceparent = '' THEN EXCLUDED.traceparent ELSE mock_provider_payments.traceparent END`,
+		input.PaymentID, input.MerchantID, input.Amount, input.Currency, telemetry.TraceParent(ctx))
+	if err != nil {
+		return Result{}, err
+	}
+	var stored Request
+	err = m.DB.QueryRow(ctx, `SELECT merchant_id, amount, currency FROM mock_provider_payments WHERE payment_id = $1`,
+		input.PaymentID).Scan(&stored.MerchantID, &stored.Amount, &stored.Currency)
+	if err != nil {
+		return Result{}, err
+	}
+	if stored.MerchantID != input.MerchantID || stored.Amount != input.Amount || stored.Currency != input.Currency {
+		return Result{}, errMockPaymentConflict
+	}
+	return m.result(ctx, input.PaymentID)
+}
+
+func (m *Mock) cancelPayment(ctx context.Context, id string) (Result, error) {
+	_, err := m.DB.Exec(ctx, `UPDATE mock_provider_payments SET status = 'CANCELED', updated_at = now(),
+		next_attempt_at = now() WHERE payment_id = $1 AND status = 'PROCESSING'`, id)
+	if err != nil {
+		return Result{}, err
+	}
+	return m.result(ctx, id)
 }
 
 func (m *Mock) result(ctx context.Context, id string) (Result, error) {

@@ -15,6 +15,8 @@ import (
 	"payway/internal/broker"
 	"payway/internal/config"
 	"payway/internal/httpapi"
+	"payway/internal/payment"
+	"payway/internal/service"
 	"payway/internal/storage"
 	"payway/internal/telemetry"
 )
@@ -52,7 +54,13 @@ func run(ctx context.Context) error {
 	}
 	commands := broker.NewWriter(cfg.KafkaBrokers, cfg.CommandsTopic)
 	defer commands.Close()
-	api := &httpapi.API{Store: &storage.Store{DB: db}, Commands: commands, CallbackSecret: cfg.CallbackSecret}
+	payments := &service.Payments{
+		Store: &storage.Store{DB: db},
+		PublishCommand: func(ctx context.Context, command payment.Command) error {
+			return broker.Publish(ctx, commands, command.PaymentID, command)
+		},
+	}
+	api := &httpapi.API{Payments: payments, CallbackSecret: cfg.CallbackSecret}
 	server := &http.Server{
 		Addr: cfg.HTTPAddr, Handler: api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
@@ -77,4 +85,3 @@ func run(ctx context.Context) error {
 		return nil
 	}
 }
-

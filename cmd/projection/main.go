@@ -16,6 +16,7 @@ import (
 	"payway/internal/broker"
 	"payway/internal/config"
 	"payway/internal/payment"
+	"payway/internal/service"
 	"payway/internal/storage"
 	"payway/internal/telemetry"
 )
@@ -51,7 +52,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return errors.New("PostgreSQL connection unavailable")
 	}
-	store := &storage.Store{DB: db}
+	projection := &service.Projection{Store: &storage.Store{DB: db}}
 	slog.Info("event consumer started")
 	err = broker.Consume(ctx, cfg.KafkaBrokers, cfg.EventsTopic, "projections", func(ctx context.Context, message kafka.Message) error {
 		var event payment.Event
@@ -61,11 +62,7 @@ func run(ctx context.Context) error {
 		if string(message.Key) != event.Payment.ID {
 			return errors.New("event key does not match payment ID")
 		}
-		if err := store.Apply(ctx, event); err != nil {
-			return err
-		}
-		slog.Info("payment event stored", "payment_id", event.Payment.ID, "event_id", event.ID, "trace_id", telemetry.TraceID(ctx))
-		return nil
+		return projection.Apply(ctx, event)
 	})
 	if ctx.Err() != nil {
 		return nil

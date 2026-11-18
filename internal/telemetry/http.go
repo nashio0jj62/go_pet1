@@ -19,6 +19,8 @@ type responseWriter struct {
 	status int
 }
 
+type paymentRequestKey struct{}
+
 func (w *responseWriter) WriteHeader(status int) {
 	if w.status != 0 {
 		return
@@ -52,9 +54,22 @@ func (w *responseWriter) Unwrap() http.ResponseWriter {
 func HTTP(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-		r = r.WithContext(ctx)
 		started := time.Now()
 		writer := &responseWriter{ResponseWriter: w}
+		var finish func()
+		startPayment := func(ctx context.Context, id string) context.Context {
+			if finish != nil {
+				finish()
+			}
+			ctx, finish = StartHTTP(ctx, writer, r.Pattern, id)
+			return ctx
+		}
+		defer func() {
+			if finish != nil {
+				finish()
+			}
+		}()
+		r = r.WithContext(context.WithValue(ctx, paymentRequestKey{}, startPayment))
 		handler.ServeHTTP(writer, r)
 		if r.URL.Path == "/healthz" {
 			return
@@ -82,6 +97,13 @@ func HTTP(handler http.Handler) http.Handler {
 				attribute.String("component", "http"), attribute.String("type", kind)))
 		}
 	})
+}
+
+func StartPaymentRequest(ctx context.Context, id string) context.Context {
+	if start, ok := ctx.Value(paymentRequestKey{}).(func(context.Context, string) context.Context); ok {
+		return start(ctx, id)
+	}
+	return ctx
 }
 
 func StartHTTP(ctx context.Context, w http.ResponseWriter, name, paymentID string) (context.Context, func()) {

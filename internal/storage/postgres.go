@@ -8,11 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"payway/internal/payment"
-	"payway/internal/telemetry"
 )
 
 var (
@@ -22,10 +19,6 @@ var (
 
 type Store struct {
 	DB *pgxpool.Pool
-}
-
-func (s *Store) Reserve(ctx context.Context, id string, data payment.CreateRequest) (time.Time, error) {
-	return s.ReserveRequest(ctx, id, data.Fingerprint())
 }
 
 func (s *Store) ReserveRequest(ctx context.Context, id, fingerprint string) (time.Time, error) {
@@ -84,31 +77,20 @@ func (s *Store) History(ctx context.Context, id string, after, limit int) ([]pay
 	return events, rows.Err()
 }
 
-func (s *Store) Apply(ctx context.Context, event payment.Event) (retErr error) {
-	ctx, span := telemetry.Tracer.Start(ctx, "payment.project", trace.WithAttributes(
-		attribute.String("payment.id", event.Payment.ID), attribute.Int("payment.version", event.Payment.Version)))
-	defer func() {
-		if retErr != nil {
-			telemetry.Error(ctx, "projection", "apply", retErr)
-		}
-		span.End()
-	}()
-	if err := event.Validate(); err != nil {
-		return err
-	}
+func (s *Store) Project(ctx context.Context, event payment.Event) ([]payment.Payment, error) {
 	payload, err := json.Marshal(event)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
 	id := event.Payment.ID
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, id); err != nil {
-		return err
+		return nil, err
 	}
 	result, err := tx.Exec(ctx, `
 		INSERT INTO payment_events (id, payment_id, command_id, type, version, payload)
@@ -116,22 +98,22 @@ func (s *Store) Apply(ctx context.Context, event payment.Event) (retErr error) {
 		ON CONFLICT (id) DO NOTHING`, event.ID, id, event.CommandID,
 		event.Type, event.Payment.Version, string(payload))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if result.RowsAffected() == 0 {
 		var same bool
 		if err := tx.QueryRow(ctx, `SELECT payload = $2::jsonb FROM payment_events WHERE id = $1`,
 			event.ID, string(payload)).Scan(&same); err != nil {
-			return err
+			return nil, err
 		}
 		if !same {
-			return errors.New("event ID reused with different data")
+			return nil, errors.New("event ID reused with different data")
 		}
 	}
 
 	current, err := scanPayment(tx.QueryRow(ctx, `SELECT `+paymentColumns+` FROM payments WHERE id = $1`, id))
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return err
+		return nil, err
 	}
 	var applied []payment.Payment
 	for {
@@ -142,20 +124,15 @@ func (s *Store) Apply(ctx context.Context, event payment.Event) (retErr error) {
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		var next payment.Event
 		if err := json.Unmarshal(data, &next); err != nil {
-			return err
+			return nil, err
 		}
 		p := next.Payment
-		if err := payment.ValidateTransition(current.Status, p.Status); err != nil {
-			return err
-		}
-		if current.Version > 0 && (p.MerchantID != current.MerchantID || p.Amount != current.Amount ||
-			p.Currency != current.Currency || !p.CreatedAt.Equal(current.CreatedAt) ||
-			p.UpdatedAt.Before(current.UpdatedAt) || (current.ProviderID != "" && p.ProviderID != current.ProviderID)) {
-			return errors.New("event changes immutable payment data or moves time backwards")
+		if err := current.ValidateUpdate(p); err != nil {
+			return nil, err
 		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO payments (`+paymentColumns+`)
@@ -165,18 +142,15 @@ func (s *Store) Apply(ctx context.Context, event payment.Event) (retErr error) {
 			failure_reason = EXCLUDED.failure_reason`, p.ID, p.MerchantID, p.Amount, p.Currency,
 			p.Status, p.Version, p.CreatedAt, p.UpdatedAt, p.ProviderID, p.FailureReason)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		current = p
 		applied = append(applied, p)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return err
+		return nil, err
 	}
-	for _, p := range applied {
-		telemetry.PaymentApplied(ctx, p)
-	}
-	return nil
+	return applied, nil
 }
 
 func (s *Store) TraceParent(ctx context.Context, id string) (string, error) {

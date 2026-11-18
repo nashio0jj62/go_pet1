@@ -10,17 +10,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/segmentio/kafka-go"
-
-	"payway/internal/broker"
 	"payway/internal/payment"
-	"payway/internal/storage"
+	"payway/internal/service"
 	"payway/internal/telemetry"
 )
 
 type API struct {
-	Store          *storage.Store
-	Commands       *kafka.Writer
+	Payments       *service.Payments
 	CallbackSecret string
 }
 
@@ -62,37 +58,14 @@ func (a *API) createPayment(w http.ResponseWriter, r *http.Request) {
 		invalidBody(w, err)
 		return
 	}
-	if err := request.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	id := payment.ID(request.MerchantID, key)
-	createdAt, err := a.Store.Reserve(ctx, id, request)
-	if errors.Is(err, storage.ErrConflict) {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
+	id, err := a.Payments.Create(ctx, key, request)
 	if err != nil {
-		slog.Error("reserve payment request", "payment_id", id, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "request storage unavailable; retry with the same Idempotency-Key")
+		writeServiceError(w, err)
 		return
 	}
-	ctx, finish := a.tracePayment(ctx, w, id, "POST /payments")
-	defer finish()
-	command := payment.NewCommand(id, request, createdAt)
-	if err := broker.Publish(ctx, a.Commands, id, command); err != nil {
-		slog.Error("publish payment command", "payment_id", id, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "publication not confirmed; retry with the same Idempotency-Key")
-		return
-	}
-	slog.Info("payment command accepted", "payment_id", id, "command_id", command.ID, "trace_id", telemetry.TraceID(ctx))
-	w.Header().Set("Location", "/payments/"+id)
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"payment_id": id, "status_url": "/payments/" + id,
-	})
+	writeAccepted(w, id, "")
 }
 
 func (a *API) getPayment(w http.ResponseWriter, r *http.Request) {
@@ -103,19 +76,44 @@ func (a *API) getPayment(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	ctx, finish := a.tracePayment(ctx, w, id, "GET /payments/{id}")
-	defer finish()
-	p, err := a.Store.Get(ctx, id)
-	if errors.Is(err, storage.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "payment not found or not yet projected")
-		return
-	}
+	p, err := a.Payments.Get(ctx, id)
 	if err != nil {
-		slog.Error("read payment", "payment_id", id, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "payment storage unavailable")
+		writeServiceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
+}
+
+func writeAccepted(w http.ResponseWriter, paymentID, commandID string) {
+	location := "/payments/" + paymentID
+	w.Header().Set("Location", location)
+	response := map[string]string{"payment_id": paymentID, "status_url": location}
+	if commandID != "" {
+		response["command_id"] = commandID
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
+
+func writeServiceError(w http.ResponseWriter, err error) {
+	var failure *service.Error
+	if !errors.As(err, &failure) {
+		slog.Error("payment request failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	status := http.StatusServiceUnavailable
+	switch failure.Kind {
+	case service.Invalid:
+		status = http.StatusBadRequest
+	case service.NotFound:
+		status = http.StatusNotFound
+	case service.Conflict:
+		status = http.StatusConflict
+	}
+	if failure.Cause != nil {
+		slog.Error(failure.Message, "error", failure.Cause)
+	}
+	writeError(w, status, failure.Message)
 }
 
 func invalidBody(w http.ResponseWriter, err error) {
@@ -139,4 +137,3 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 		slog.Warn("write HTTP response", "error", err)
 	}
 }
-

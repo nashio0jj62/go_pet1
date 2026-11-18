@@ -106,3 +106,14 @@ func (s Status) Terminal() bool {
 	return s == Completed || s == Failed || s == Canceled
 }
 
+func (p Payment) ValidateUpdate(next Payment) error {
+	if err := ValidateTransition(p.Status, next.Status); err != nil {
+		return err
+	}
+	if p.Version > 0 && (p.MerchantID != next.MerchantID || p.Amount != next.Amount ||
+		p.Currency != next.Currency || !p.CreatedAt.Equal(next.CreatedAt) ||
+		next.UpdatedAt.Before(p.UpdatedAt) || (p.ProviderID != "" && next.ProviderID != p.ProviderID)) {
+		return errors.New("event changes immutable payment data or moves time backwards")
+	}
+	return nil
+}

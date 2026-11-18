@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -10,13 +11,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 
 	"payway/internal/broker"
 	"payway/internal/config"
+	"payway/internal/payment"
 	"payway/internal/provider"
+	"payway/internal/service"
 	"payway/internal/storage"
 	"payway/internal/telemetry"
-	"payway/internal/worker"
 )
 
 func main() {
@@ -52,12 +55,24 @@ func run(ctx context.Context) error {
 	}
 	events := broker.NewWriter(cfg.KafkaBrokers, cfg.EventsTopic)
 	defer events.Close()
-	w := &worker.Worker{
-		Events: events, Store: &storage.Store{DB: db},
+	commands := &service.Commands{
+		Store:    &storage.Store{DB: db},
 		Provider: provider.NewClient(cfg.ProviderURL, cfg.CallbackSecret),
+		PublishEvent: func(ctx context.Context, event payment.Event) error {
+			return broker.Publish(ctx, events, event.Payment.ID, event)
+		},
 	}
 	slog.Info("command consumer started")
-	err = broker.Consume(ctx, cfg.KafkaBrokers, cfg.CommandsTopic, "payment-workers", w.HandleCommand)
+	err = broker.Consume(ctx, cfg.KafkaBrokers, cfg.CommandsTopic, "payment-workers", func(ctx context.Context, message kafka.Message) error {
+		var command payment.Command
+		if err := json.Unmarshal(message.Value, &command); err != nil {
+			return err
+		}
+		if string(message.Key) != command.PaymentID {
+			return errors.New("invalid payment command")
+		}
+		return commands.Handle(ctx, command)
+	})
 	if ctx.Err() != nil {
 		return nil
 	}

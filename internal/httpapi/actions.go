@@ -3,22 +3,15 @@ package httpapi
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
-	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
 	"time"
 
-	"payway/internal/broker"
 	"payway/internal/payment"
 	"payway/internal/provider"
-	"payway/internal/storage"
-	"payway/internal/telemetry"
 )
 
 func (a *API) cancelPayment(w http.ResponseWriter, r *http.Request) {
@@ -29,27 +22,12 @@ func (a *API) cancelPayment(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	ctx, finish := a.tracePayment(ctx, w, id, "POST /payments/{id}/cancel")
-	defer finish()
-	p, err := a.Store.Get(ctx, id)
-	if readError(w, err) {
-		return
-	}
-	if p.Status == payment.Completed || p.Status == payment.Failed {
-		writeError(w, http.StatusConflict, "payment is already finished")
-		return
-	}
-	commandID := "cancel_" + id
-	createdAt, err := a.Store.ReserveRequest(ctx, commandID, commandID)
+	commandID, err := a.Payments.Cancel(ctx, id)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "request storage unavailable")
+		writeServiceError(w, err)
 		return
 	}
-	command := payment.Command{
-		ID: commandID, Type: payment.CancelPayment, SchemaVersion: 1,
-		PaymentID: id, CreatedAt: createdAt,
-	}
-	a.accept(w, ctx, command)
+	writeAccepted(w, id, commandID)
 }
 
 func (a *API) paymentHistory(w http.ResponseWriter, r *http.Request) {
@@ -76,13 +54,9 @@ func (a *API) paymentHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	ctx, finish := a.tracePayment(ctx, w, id, "GET /payments/{id}/events")
-	defer finish()
-	if _, err := a.Store.Get(ctx, id); readError(w, err) {
-		return
-	}
-	events, err := a.Store.History(ctx, id, after, limit)
-	if readError(w, err) {
+	events, err := a.Payments.History(ctx, id, after, limit)
+	if err != nil {
+		writeServiceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, events)
@@ -118,92 +92,12 @@ func (a *API) providerCallback(w http.ResponseWriter, r *http.Request) {
 		invalidBody(w, err)
 		return
 	}
-	if err := callback.Result.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if payment.ValidateKey(callback.EventID) != nil || !callback.Status.Terminal() {
-		writeError(w, http.StatusBadRequest, "invalid callback event ID or status")
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	ctx, finish := a.tracePayment(ctx, w, callback.PaymentID, "POST /callbacks/mock")
-	defer finish()
-	p, err := a.Store.Get(ctx, callback.PaymentID)
-	if readError(w, err) {
-		return
-	}
-	if p.ProviderID != "" && p.ProviderID != callback.ProviderID {
-		writeError(w, http.StatusConflict, "provider reference does not match payment")
-		return
-	}
-	idSum := sha256.Sum256([]byte(callback.EventID))
-	commandID := "callback_" + hex.EncodeToString(idSum[:])
-	canonical, _ := json.Marshal(callback)
-	bodySum := sha256.Sum256(canonical)
-	_, err = a.Store.ReserveRequest(ctx, commandID, hex.EncodeToString(bodySum[:]))
-	if errors.Is(err, storage.ErrConflict) {
-		writeError(w, http.StatusConflict, "callback event ID reused with different data")
-		return
-	}
+	commandID, err := a.Payments.Callback(ctx, callback)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "request storage unavailable")
+		writeServiceError(w, err)
 		return
 	}
-	a.accept(w, ctx, payment.Command{
-		ID: commandID, Type: payment.ProviderCallback, SchemaVersion: 1,
-		PaymentID: callback.PaymentID, CreatedAt: callback.UpdatedAt.UTC(),
-		ProviderID: callback.ProviderID, Result: callback.Status, FailureReason: callback.FailureReason,
-	})
-}
-
-func (a *API) accept(w http.ResponseWriter, ctx context.Context, command payment.Command) {
-	if err := broker.Publish(ctx, a.Commands, command.PaymentID, command); err != nil {
-		slog.Error("publish command", "command_id", command.ID, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "publication not confirmed; retry the same request")
-		return
-	}
-	w.Header().Set("Location", "/payments/"+command.PaymentID)
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"payment_id": command.PaymentID, "command_id": command.ID,
-		"status_url": "/payments/" + command.PaymentID,
-	})
-}
-
-func readError(w http.ResponseWriter, err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, storage.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "payment not found or not yet projected")
-	} else {
-		slog.Error("read payment data", "error", err)
-		writeError(w, http.StatusServiceUnavailable, "payment storage unavailable")
-	}
-	return true
-}
-
-func (a *API) tracePayment(ctx context.Context, w http.ResponseWriter, id, name string) (context.Context, func()) {
-	parent, err := a.Store.TraceParent(ctx, id)
-	if err != nil {
-		slog.Warn("read payment trace", "payment_id", id, "error", err)
-	}
-	if parent != "" {
-		storedCtx := telemetry.Parent(ctx, parent)
-		if telemetry.TraceID(storedCtx) != telemetry.TraceID(ctx) {
-			ctx = storedCtx
-		}
-	}
-	ctx, finish := telemetry.StartHTTP(ctx, w, name, id)
-	if parent == "" && telemetry.TraceParent(ctx) != "" {
-		stored, err := a.Store.RememberTrace(ctx, id, telemetry.TraceParent(ctx))
-		if err != nil {
-			slog.Warn("save payment trace", "payment_id", id, "error", err)
-		} else if stored != telemetry.TraceParent(ctx) {
-			finish()
-			ctx, finish = telemetry.StartHTTP(telemetry.Parent(ctx, stored), w, name, id)
-		}
-	}
-	return ctx, finish
+	writeAccepted(w, callback.PaymentID, commandID)
 }

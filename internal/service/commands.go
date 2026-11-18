@@ -1,4 +1,4 @@
-package worker
+package service
 
 import (
 	"context"
@@ -9,28 +9,21 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/segmentio/kafka-go"
-
-	"payway/internal/broker"
 	"payway/internal/payment"
 	"payway/internal/provider"
 	"payway/internal/storage"
 	"payway/internal/telemetry"
 )
 
-type Worker struct {
-	Events   *kafka.Writer
-	Store    *storage.Store
-	Provider *provider.Client
+type Commands struct {
+	Store        *storage.Store
+	Provider     *provider.Client
+	PublishEvent func(context.Context, payment.Event) error
 }
 
-func (w *Worker) HandleCommand(ctx context.Context, message kafka.Message) error {
-	var command payment.Command
-	if err := json.Unmarshal(message.Value, &command); err != nil {
-		return err
-	}
+func (s *Commands) Handle(ctx context.Context, command payment.Command) error {
 	if command.SchemaVersion != 1 || !payment.ValidID(command.PaymentID) || command.CreatedAt.IsZero() ||
-		command.ID == "" || len(command.ID) > 200 || string(message.Key) != command.PaymentID {
+		command.ID == "" || len(command.ID) > 200 {
 		return errors.New("invalid payment command")
 	}
 	command.CreatedAt = command.CreatedAt.UTC()
@@ -40,7 +33,7 @@ func (w *Worker) HandleCommand(ctx context.Context, message kafka.Message) error
 	}
 	sum := sha256.Sum256(payload)
 	fingerprint := hex.EncodeToString(sum[:])
-	completed, err := w.Store.CommandCompleted(ctx, command.ID, fingerprint)
+	completed, err := s.Store.CommandCompleted(ctx, command.ID, fingerprint)
 	if err != nil {
 		return err
 	}
@@ -51,31 +44,31 @@ func (w *Worker) HandleCommand(ctx context.Context, message kafka.Message) error
 
 	switch command.Type {
 	case payment.CreatePayment:
-		err = w.create(ctx, command)
+		err = s.create(ctx, command)
 	case payment.CancelPayment:
 		if command.ID != "cancel_"+command.PaymentID {
 			return errors.New("invalid cancellation command ID")
 		}
-		err = w.cancel(ctx, command)
+		err = s.cancel(ctx, command)
 	case payment.ProviderCallback:
-		err = w.callback(ctx, command)
+		err = s.callback(ctx, command)
 	default:
 		return errors.New("unknown payment command")
 	}
 	if err != nil {
 		return err
 	}
-	return w.Store.MarkCommandCompleted(ctx, command.ID, command.PaymentID, fingerprint)
+	return s.Store.MarkCommandCompleted(ctx, command.ID, command.PaymentID, fingerprint)
 }
 
-func (w *Worker) create(ctx context.Context, command payment.Command) error {
+func (s *Commands) create(ctx context.Context, command payment.Command) error {
 	event, err := payment.CreatedEvent(command)
 	if err != nil {
 		return err
 	}
-	p, err := w.Store.Get(ctx, command.PaymentID)
+	p, err := s.Store.Get(ctx, command.PaymentID)
 	if errors.Is(err, storage.ErrNotFound) {
-		p, err = w.publish(ctx, event)
+		p, err = s.publish(ctx, event)
 	}
 	if err != nil {
 		return err
@@ -86,7 +79,7 @@ func (w *Worker) create(ctx context.Context, command payment.Command) error {
 	if p.Status.Terminal() {
 		return nil
 	}
-	result, err := w.Provider.Start(ctx, p)
+	result, err := s.Provider.Start(ctx, p)
 	if err != nil {
 		return err
 	}
@@ -101,7 +94,7 @@ func (w *Worker) create(ctx context.Context, command payment.Command) error {
 		if err != nil {
 			return err
 		}
-		p, err = w.publish(ctx, event)
+		p, err = s.publish(ctx, event)
 		if err != nil {
 			return err
 		}
@@ -109,13 +102,13 @@ func (w *Worker) create(ctx context.Context, command payment.Command) error {
 	if result.Status.Terminal() && !p.Status.Terminal() {
 		command.ID = "result_" + p.ID + "_" + string(result.Status)
 		command.CreatedAt = result.UpdatedAt
-		return w.finish(ctx, command, p, result)
+		return s.finish(ctx, command, p, result)
 	}
 	return nil
 }
 
-func (w *Worker) cancel(ctx context.Context, command payment.Command) error {
-	p, err := w.Store.Get(ctx, command.PaymentID)
+func (s *Commands) cancel(ctx context.Context, command payment.Command) error {
+	p, err := s.Store.Get(ctx, command.PaymentID)
 	if err != nil {
 		return err
 	}
@@ -127,7 +120,7 @@ func (w *Worker) cancel(ctx context.Context, command payment.Command) error {
 		Status: payment.Canceled, UpdatedAt: command.CreatedAt,
 	}
 	if p.Status == payment.Processing {
-		result, err = w.Provider.Cancel(ctx, p.ID)
+		result, err = s.Provider.Cancel(ctx, p.ID)
 		if err != nil {
 			return err
 		}
@@ -139,10 +132,10 @@ func (w *Worker) cancel(ctx context.Context, command payment.Command) error {
 		}
 	}
 	command.CreatedAt = result.UpdatedAt
-	return w.finish(ctx, command, p, result)
+	return s.finish(ctx, command, p, result)
 }
 
-func (w *Worker) callback(ctx context.Context, command payment.Command) error {
+func (s *Commands) callback(ctx context.Context, command payment.Command) error {
 	result := provider.Result{
 		PaymentID: command.PaymentID, ProviderID: command.ProviderID,
 		Status: command.Result, FailureReason: command.FailureReason, UpdatedAt: command.CreatedAt,
@@ -153,7 +146,7 @@ func (w *Worker) callback(ctx context.Context, command payment.Command) error {
 	if !result.Status.Terminal() {
 		return errors.New("callback status must be terminal")
 	}
-	p, err := w.Store.Get(ctx, command.PaymentID)
+	p, err := s.Store.Get(ctx, command.PaymentID)
 	if err != nil {
 		return err
 	}
@@ -166,27 +159,27 @@ func (w *Worker) callback(ctx context.Context, command payment.Command) error {
 	if p.Status != payment.Processing || p.ProviderID != command.ProviderID {
 		return errors.New("callback does not match the active provider payment")
 	}
-	return w.finish(ctx, command, p, result)
+	return s.finish(ctx, command, p, result)
 }
 
-func (w *Worker) finish(ctx context.Context, command payment.Command, p payment.Payment, result provider.Result) error {
+func (s *Commands) finish(ctx context.Context, command payment.Command, p payment.Payment, result provider.Result) error {
 	event, err := payment.ChangeEvent(command, p, result.Status, result.ProviderID, result.FailureReason)
 	if err != nil {
 		return err
 	}
-	_, err = w.publish(ctx, event)
+	_, err = s.publish(ctx, event)
 	return err
 }
 
-func (w *Worker) publish(ctx context.Context, event payment.Event) (payment.Payment, error) {
-	if err := broker.Publish(ctx, w.Events, event.Payment.ID, event); err != nil {
+func (s *Commands) publish(ctx context.Context, event payment.Event) (payment.Payment, error) {
+	if err := s.PublishEvent(ctx, event); err != nil {
 		return payment.Payment{}, err
 	}
 	slog.Info("payment event published", "payment_id", event.Payment.ID, "event_id", event.ID, "trace_id", telemetry.TraceID(ctx))
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		p, err := w.Store.Get(ctx, event.Payment.ID)
+		p, err := s.Store.Get(ctx, event.Payment.ID)
 		if err == nil && p.Version >= event.Payment.Version {
 			return p, nil
 		}
