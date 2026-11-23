@@ -12,10 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"payway/internal/broker"
 	"payway/internal/config"
 	"payway/internal/httpapi"
-	"payway/internal/payment"
 	"payway/internal/service"
 	"payway/internal/storage"
 	"payway/internal/telemetry"
@@ -52,14 +50,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return errors.New("PostgreSQL connection unavailable")
 	}
-	commands := broker.NewWriter(cfg.KafkaBrokers, cfg.CommandsTopic)
-	defer commands.Close()
-	payments := &service.Payments{
-		Store: &storage.Store{DB: db},
-		PublishCommand: func(ctx context.Context, command payment.Command) error {
-			return broker.Publish(ctx, commands, command.PaymentID, command)
-		},
-	}
+	payments := &service.Payments{Store: &storage.Store{DB: db}}
 	api := &httpapi.API{Payments: payments, CallbackSecret: cfg.CallbackSecret}
 	server := &http.Server{
 		Addr: cfg.HTTPAddr, Handler: api.Handler(),

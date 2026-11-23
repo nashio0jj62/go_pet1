@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -26,7 +27,7 @@ func (s *Projection) Apply(ctx context.Context, event payment.Event) (retErr err
 		span.End()
 	}()
 	if err := event.Validate(); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", payment.ErrInvalidMessage, err)
 	}
 	applied, err := s.Store.Project(ctx, event)
 	if err != nil {

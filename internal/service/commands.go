@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -24,7 +25,7 @@ type Commands struct {
 func (s *Commands) Handle(ctx context.Context, command payment.Command) error {
 	if command.SchemaVersion != 1 || !payment.ValidID(command.PaymentID) || command.CreatedAt.IsZero() ||
 		command.ID == "" || len(command.ID) > 200 {
-		return errors.New("invalid payment command")
+		return fmt.Errorf("%w: invalid command envelope", payment.ErrInvalidMessage)
 	}
 	command.CreatedAt = command.CreatedAt.UTC()
 	payload, err := json.Marshal(command)
@@ -47,13 +48,13 @@ func (s *Commands) Handle(ctx context.Context, command payment.Command) error {
 		err = s.create(ctx, command)
 	case payment.CancelPayment:
 		if command.ID != "cancel_"+command.PaymentID {
-			return errors.New("invalid cancellation command ID")
+			return fmt.Errorf("%w: invalid cancellation command ID", payment.ErrInvalidMessage)
 		}
 		err = s.cancel(ctx, command)
 	case payment.ProviderCallback:
 		err = s.callback(ctx, command)
 	default:
-		return errors.New("unknown payment command")
+		return fmt.Errorf("%w: unknown command type", payment.ErrInvalidMessage)
 	}
 	if err != nil {
 		return err
@@ -64,7 +65,7 @@ func (s *Commands) Handle(ctx context.Context, command payment.Command) error {
 func (s *Commands) create(ctx context.Context, command payment.Command) error {
 	event, err := payment.CreatedEvent(command)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", payment.ErrInvalidMessage, err)
 	}
 	p, err := s.Store.Get(ctx, command.PaymentID)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -74,7 +75,7 @@ func (s *Commands) create(ctx context.Context, command payment.Command) error {
 		return err
 	}
 	if p.MerchantID != command.Data.MerchantID || p.Amount != command.Data.Amount || p.Currency != command.Data.Currency {
-		return errors.New("creation command conflicts with existing payment")
+		return fmt.Errorf("%w: creation command conflicts with existing payment", payment.ErrInvalidMessage)
 	}
 	if p.Status.Terminal() {
 		return nil
@@ -141,10 +142,10 @@ func (s *Commands) callback(ctx context.Context, command payment.Command) error 
 		Status: command.Result, FailureReason: command.FailureReason, UpdatedAt: command.CreatedAt,
 	}
 	if err := result.Validate(); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", payment.ErrInvalidMessage, err)
 	}
 	if !result.Status.Terminal() {
-		return errors.New("callback status must be terminal")
+		return fmt.Errorf("%w: callback status must be terminal", payment.ErrInvalidMessage)
 	}
 	p, err := s.Store.Get(ctx, command.PaymentID)
 	if err != nil {

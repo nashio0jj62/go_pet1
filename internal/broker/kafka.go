@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -13,15 +14,26 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"payway/internal/payment"
 	"payway/internal/telemetry"
 )
+
+type RejectedMessage struct {
+	Group     string
+	Topic     string
+	Partition int
+	Offset    int64
+	Key       []byte
+	Payload   []byte
+	Reason    string
+}
 
 func NewWriter(brokers []string, topic string) *kafka.Writer {
 	return &kafka.Writer{
 		Addr: kafka.TCP(brokers...), Topic: topic,
 		Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll,
 		BatchTimeout: 10 * time.Millisecond,
-		ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second,
+		ReadTimeout:  5 * time.Second, WriteTimeout: 5 * time.Second,
 		MaxAttempts: 3,
 	}
 }
@@ -48,7 +60,7 @@ func Publish(ctx context.Context, writer *kafka.Writer, paymentID string, value 
 	return writer.WriteMessages(ctx, message)
 }
 
-func Consume(ctx context.Context, brokers []string, topic, group string, handle func(context.Context, kafka.Message) error) error {
+func Consume(ctx context.Context, brokers []string, topic, group string, handle func(context.Context, kafka.Message) error, reject func(context.Context, RejectedMessage) error) error {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers, Topic: topic, GroupID: group,
 		MinBytes: 1, MaxBytes: 10e6, MaxWait: time.Second,
@@ -76,6 +88,20 @@ func Consume(ctx context.Context, brokers []string, topic, group string, handle 
 				trace.WithAttributes(attribute.String("messaging.destination.name", topic),
 					attribute.String("payment.id", string(message.Key)), attribute.Int64("messaging.offset", message.Offset)))
 			err = handle(attemptCtx, message)
+			if errors.Is(err, payment.ErrInvalidMessage) {
+				reason := err
+				err = reject(attemptCtx, RejectedMessage{
+					Group: group, Topic: topic, Partition: message.Partition, Offset: message.Offset,
+					Key: message.Key, Payload: message.Value, Reason: reason.Error(),
+				})
+				if err == nil {
+					telemetry.Error(attemptCtx, "kafka", "rejected_message", reason)
+					slog.Warn("message stored in quarantine", "topic", topic, "group", group,
+						"partition", message.Partition, "offset", message.Offset, "reason", reason)
+				} else {
+					err = fmt.Errorf("store rejected message: %w", err)
+				}
+			}
 			if err != nil && ctx.Err() == nil {
 				telemetry.Error(attemptCtx, "kafka", "process", err)
 				telemetry.Retry(attemptCtx, topic)
@@ -111,4 +137,3 @@ func Consume(ctx context.Context, brokers []string, topic, group string, handle 
 		}
 	}
 }
-

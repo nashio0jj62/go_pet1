@@ -1,0 +1,33 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payway
+          POSTGRES_PASSWORD: payway_test_only
+          POSTGRES_DB: payway
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U payway -d payway"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+        env:
+          PAYWAY_TEST_DATABASE_URL: postgres://payway:payway_test_only@localhost:${{ job.services.postgres.ports[5432] }}/payway?sslmode=disable
+      - run: go vet ./...

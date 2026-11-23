@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+var ErrInvalidMessage = errors.New("invalid payment message")
+
 const (
 	CreatePayment     = "CreatePayment"
 	CancelPayment     = "CancelPayment"

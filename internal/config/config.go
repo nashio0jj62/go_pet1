@@ -8,15 +8,15 @@ import (
 )
 
 type Backend struct {
-	DatabaseURL  string
-	KafkaBrokers []string
-	EventsTopic  string
+	DatabaseURL   string
+	KafkaBrokers  []string
+	CommandsTopic string
+	EventsTopic   string
 }
 
 type Config struct {
 	Backend
 	HTTPAddr       string
-	CommandsTopic  string
 	ProviderURL    string
 	CallbackURL    string
 	CallbackSecret string
@@ -24,8 +24,9 @@ type Config struct {
 
 func LoadBackend() (Backend, error) {
 	c := Backend{
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		EventsTopic: value("KAFKA_EVENTS_TOPIC", "payment.events"),
+		DatabaseURL:   os.Getenv("DATABASE_URL"),
+		CommandsTopic: value("KAFKA_COMMANDS_TOPIC", "payment.commands"),
+		EventsTopic:   value("KAFKA_EVENTS_TOPIC", "payment.events"),
 	}
 	for _, broker := range strings.Split(value("KAFKA_BROKERS", "localhost:9092"), ",") {
 		broker = strings.TrimSpace(broker)
@@ -36,6 +37,9 @@ func LoadBackend() (Backend, error) {
 	}
 	if c.DatabaseURL == "" {
 		return Backend{}, errors.New("DATABASE_URL is required")
+	}
+	if c.CommandsTopic == c.EventsTopic {
+		return Backend{}, errors.New("commands and events must use different Kafka topics")
 	}
 	return c, nil
 }
@@ -48,16 +52,12 @@ func Load() (Config, error) {
 	c := Config{
 		Backend:        backend,
 		HTTPAddr:       value("HTTP_ADDR", ":8080"),
-		CommandsTopic:  value("KAFKA_COMMANDS_TOPIC", "payment.commands"),
 		ProviderURL:    value("PROVIDER_URL", "http://localhost:8081"),
 		CallbackURL:    value("CALLBACK_URL", "http://localhost:8080/callbacks/mock"),
 		CallbackSecret: os.Getenv("CALLBACK_SECRET"),
 	}
 	if len(c.CallbackSecret) < 32 {
 		return Config{}, errors.New("CALLBACK_SECRET must contain at least 32 characters")
-	}
-	if c.CommandsTopic == c.EventsTopic {
-		return Config{}, errors.New("commands and events must use different Kafka topics")
 	}
 	for _, address := range []string{c.ProviderURL, c.CallbackURL} {
 		u, err := url.Parse(address)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"time"
 
 	"payway/internal/payment"
 	"payway/internal/provider"
@@ -15,8 +16,7 @@ import (
 )
 
 type Payments struct {
-	Store          *storage.Store
-	PublishCommand func(context.Context, payment.Command) error
+	Store *storage.Store
 }
 
 type ErrorKind int
@@ -47,17 +47,20 @@ func (s *Payments) Create(ctx context.Context, key string, request payment.Creat
 		return "", &Error{Kind: Invalid, Message: err.Error()}
 	}
 	id := payment.ID(request.MerchantID, key)
-	createdAt, err := s.Store.ReserveRequest(ctx, id, request.Fingerprint())
+	ctx = telemetry.StartPaymentRequest(ctx, id)
+	command := payment.NewCommand(id, request, time.Time{})
+	parent, err := s.Store.EnqueueCommand(ctx, id, request.Fingerprint(), telemetry.TraceParent(ctx), command)
 	if errors.Is(err, storage.ErrConflict) {
 		return "", &Error{Kind: Conflict, Message: err.Error()}
 	}
 	if err != nil {
 		return "", &Error{Kind: Unavailable, Message: "request storage unavailable; retry with the same Idempotency-Key", Cause: err}
 	}
-	ctx = s.tracePayment(ctx, id)
-	command := payment.NewCommand(id, request, createdAt)
-	if err := s.PublishCommand(ctx, command); err != nil {
-		return "", &Error{Kind: Unavailable, Message: "publication not confirmed; retry with the same Idempotency-Key", Cause: err}
+	if parent != "" {
+		storedCtx := telemetry.Parent(ctx, parent)
+		if telemetry.TraceID(storedCtx) != telemetry.TraceID(ctx) {
+			ctx = telemetry.StartPaymentRequest(storedCtx, id)
+		}
 	}
 	slog.Info("payment command accepted", "payment_id", id, "command_id", command.ID, "trace_id", telemetry.TraceID(ctx))
 	return id, nil
@@ -89,14 +92,13 @@ func (s *Payments) Cancel(ctx context.Context, id string) (string, error) {
 		return "", &Error{Kind: Conflict, Message: "payment is already finished"}
 	}
 	commandID := "cancel_" + id
-	createdAt, err := s.Store.ReserveRequest(ctx, commandID, commandID)
+	_, err = s.Store.EnqueueCommand(ctx, commandID, commandID, telemetry.TraceParent(ctx), payment.Command{
+		ID: commandID, Type: payment.CancelPayment, SchemaVersion: 1, PaymentID: id,
+	})
 	if err != nil {
 		return "", &Error{Kind: Unavailable, Message: "request storage unavailable", Cause: err}
 	}
-	return s.publish(ctx, payment.Command{
-		ID: commandID, Type: payment.CancelPayment, SchemaVersion: 1,
-		PaymentID: id, CreatedAt: createdAt,
-	})
+	return commandID, nil
 }
 
 func (s *Payments) Callback(ctx context.Context, callback provider.Callback) (string, error) {
@@ -121,18 +123,18 @@ func (s *Payments) Callback(ctx context.Context, callback provider.Callback) (st
 		return "", &Error{Kind: Invalid, Message: "invalid callback data"}
 	}
 	bodySum := sha256.Sum256(canonical)
-	_, err = s.Store.ReserveRequest(ctx, commandID, hex.EncodeToString(bodySum[:]))
+	_, err = s.Store.EnqueueCommand(ctx, commandID, hex.EncodeToString(bodySum[:]), telemetry.TraceParent(ctx), payment.Command{
+		ID: commandID, Type: payment.ProviderCallback, SchemaVersion: 1,
+		PaymentID: callback.PaymentID, CreatedAt: callback.UpdatedAt.UTC(),
+		ProviderID: callback.ProviderID, Result: callback.Status, FailureReason: callback.FailureReason,
+	})
 	if errors.Is(err, storage.ErrConflict) {
 		return "", &Error{Kind: Conflict, Message: "callback event ID reused with different data"}
 	}
 	if err != nil {
 		return "", &Error{Kind: Unavailable, Message: "request storage unavailable", Cause: err}
 	}
-	return s.publish(ctx, payment.Command{
-		ID: commandID, Type: payment.ProviderCallback, SchemaVersion: 1,
-		PaymentID: callback.PaymentID, CreatedAt: callback.UpdatedAt.UTC(),
-		ProviderID: callback.ProviderID, Result: callback.Status, FailureReason: callback.FailureReason,
-	})
+	return commandID, nil
 }
 
 func (s *Payments) get(ctx context.Context, id string) (payment.Payment, error) {
@@ -144,13 +146,6 @@ func (s *Payments) get(ctx context.Context, id string) (payment.Payment, error) 
 		return payment.Payment{}, &Error{Kind: Unavailable, Message: "payment storage unavailable", Cause: err}
 	}
 	return p, nil
-}
-
-func (s *Payments) publish(ctx context.Context, command payment.Command) (string, error) {
-	if err := s.PublishCommand(ctx, command); err != nil {
-		return "", &Error{Kind: Unavailable, Message: "publication not confirmed; retry the same request", Cause: err}
-	}
-	return command.ID, nil
 }
 
 func (s *Payments) tracePayment(ctx context.Context, id string) context.Context {

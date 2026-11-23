@@ -1,6 +1,8 @@
 .*
 !.gitignore
 !.dockerignore
+!.github/
+/output/
 *.env
 *.pem
 *.key

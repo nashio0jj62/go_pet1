@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -52,18 +53,19 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return errors.New("PostgreSQL connection unavailable")
 	}
-	projection := &service.Projection{Store: &storage.Store{DB: db}}
+	store := &storage.Store{DB: db}
+	projection := &service.Projection{Store: store}
 	slog.Info("event consumer started")
 	err = broker.Consume(ctx, cfg.KafkaBrokers, cfg.EventsTopic, "projections", func(ctx context.Context, message kafka.Message) error {
 		var event payment.Event
 		if err := json.Unmarshal(message.Value, &event); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", payment.ErrInvalidMessage, err)
 		}
 		if string(message.Key) != event.Payment.ID {
-			return errors.New("event key does not match payment ID")
+			return fmt.Errorf("%w: event key does not match payment ID", payment.ErrInvalidMessage)
 		}
 		return projection.Apply(ctx, event)
-	})
+	}, store.SaveRejection)
 	if ctx.Err() != nil {
 		return nil
 	}

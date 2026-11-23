@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -55,8 +56,9 @@ func run(ctx context.Context) error {
 	}
 	events := broker.NewWriter(cfg.KafkaBrokers, cfg.EventsTopic)
 	defer events.Close()
+	store := &storage.Store{DB: db}
 	commands := &service.Commands{
-		Store:    &storage.Store{DB: db},
+		Store:    store,
 		Provider: provider.NewClient(cfg.ProviderURL, cfg.CallbackSecret),
 		PublishEvent: func(ctx context.Context, event payment.Event) error {
 			return broker.Publish(ctx, events, event.Payment.ID, event)
@@ -66,13 +68,13 @@ func run(ctx context.Context) error {
 	err = broker.Consume(ctx, cfg.KafkaBrokers, cfg.CommandsTopic, "payment-workers", func(ctx context.Context, message kafka.Message) error {
 		var command payment.Command
 		if err := json.Unmarshal(message.Value, &command); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", payment.ErrInvalidMessage, err)
 		}
 		if string(message.Key) != command.PaymentID {
-			return errors.New("invalid payment command")
+			return fmt.Errorf("%w: command key does not match payment ID", payment.ErrInvalidMessage)
 		}
 		return commands.Handle(ctx, command)
-	})
+	}, store.SaveRejection)
 	if ctx.Err() != nil {
 		return nil
 	}

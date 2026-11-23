@@ -3,11 +3,14 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
+
+	"payway/internal/payment"
 )
 
-var errCommandConflict = errors.New("command ID reused with different data")
+var errCommandConflict = fmt.Errorf("%w: command ID reused with different data", payment.ErrInvalidMessage)
 
 func (s *Store) CommandCompleted(ctx context.Context, id, fingerprint string) (bool, error) {
 	var same bool

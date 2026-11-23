@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"time"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"payway/internal/payment"
@@ -19,21 +20,6 @@ var (
 
 type Store struct {
 	DB *pgxpool.Pool
-}
-
-func (s *Store) ReserveRequest(ctx context.Context, id, fingerprint string) (time.Time, error) {
-	var createdAt time.Time
-	err := s.DB.QueryRow(ctx, `
-		INSERT INTO payment_requests (payment_id, fingerprint)
-		VALUES ($1, $2)
-		ON CONFLICT (payment_id) DO UPDATE
-		SET fingerprint = payment_requests.fingerprint
-		WHERE payment_requests.fingerprint = EXCLUDED.fingerprint
-		RETURNING created_at`, id, fingerprint).Scan(&createdAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, ErrConflict
-	}
-	return createdAt.UTC(), err
 }
 
 func scanPayment(row pgx.Row) (payment.Payment, error) {
@@ -98,6 +84,10 @@ func (s *Store) Project(ctx context.Context, event payment.Event) ([]payment.Pay
 		ON CONFLICT (id) DO NOTHING`, event.ID, id, event.CommandID,
 		event.Type, event.Payment.Version, string(payload))
 	if err != nil {
+		var conflict *pgconn.PgError
+		if errors.As(err, &conflict) && conflict.ConstraintName == "payment_events_payment_id_version_key" {
+			return nil, fmt.Errorf("%w: payment version already has a different event", payment.ErrInvalidMessage)
+		}
 		return nil, err
 	}
 	if result.RowsAffected() == 0 {
@@ -107,7 +97,7 @@ func (s *Store) Project(ctx context.Context, event payment.Event) ([]payment.Pay
 			return nil, err
 		}
 		if !same {
-			return nil, errors.New("event ID reused with different data")
+			return nil, fmt.Errorf("%w: event ID reused with different data", payment.ErrInvalidMessage)
 		}
 	}
 
